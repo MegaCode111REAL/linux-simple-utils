@@ -1,324 +1,793 @@
-```bash
 #!/usr/bin/env bash
 
 # ============================================================
 # wifi.sh
-# Simple NetworkManager Wi-Fi controller
-# Requires: nmcli
+# Wi-Fi manager for Armbian / Debian
+#
+# Backend:
+#   iw                -> scanning
+#   Netplan           -> configuration
+#   systemd-networkd  -> networking
+#   wpa_supplicant    -> Wi-Fi authentication
+#
+# Supports:
+#   Open Wi-Fi
+#   WPA/WPA2-Personal
+#
 # ============================================================
 
-set -o pipefail
+set -u
 
-# ---------- Configuration ----------
+SCRIPT_NAME="$(basename "$0")"
+CONFIG="/etc/netplan/99-wifi-manager.yaml"
+IFACE=""
 
-TABLE_WIDTH=42
+# ------------------------------------------------------------
+# Colours
+# ------------------------------------------------------------
 
-# ---------- Helpers ----------
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    RED='\033[31m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+    CYAN='\033[36m'
+    RESET='\033[0m'
+else
+    BOLD=''
+    DIM=''
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    RESET=''
+fi
+
+# ------------------------------------------------------------
+# Basic helpers
+# ------------------------------------------------------------
 
 die() {
-    echo "wifi: $*" >&2
+    echo -e "${RED}Error:${RESET} $*" >&2
     exit 1
 }
 
-require_nmcli() {
-    command -v nmcli >/dev/null 2>&1 || die "nmcli was not found. Install NetworkManager first."
+info() {
+    echo -e "${CYAN}→${RESET} $*"
 }
 
-wifi_state() {
-    nmcli -t -f WIFI general 2>/dev/null
+success() {
+    echo -e "${GREEN}✓${RESET} $*"
 }
 
-is_wifi_enabled() {
-    [[ "$(wifi_state)" == "enabled" ]]
+warning() {
+    echo -e "${YELLOW}!${RESET} $*"
 }
 
-# Escape strings containing ':' for nmcli's terse output.
-# nmcli uses ':' as its field separator.
-nm_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/:/\\:/g'
+require_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        die "'$1' is required but is not installed."
 }
 
-# ---------- Main display ----------
-
-show_table() {
-    local wifi_status
-    wifi_status="$(wifi_state)"
-
-    echo
-    echo "┌──────────────────────────────────────────────────────────┐"
-    printf "│ %-56s │\n" "Wi-Fi"
-    echo "├──────────────────────────────────────────────────────────┤"
-
-    if [[ "$wifi_status" != "enabled" ]]; then
-        printf "│ %-56s │\n" "Wi-Fi: disabled"
-        echo "└──────────────────────────────────────────────────────────┘"
-        return
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" "$@"
     fi
-
-    # Get currently connected SSID.
-    local connected
-    connected="$(
-        nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null |
-        awk -F: '$1 == "yes" { print substr($0,4); exit }'
-    )"
-
-    # Known connection profiles.
-    declare -A known
-    while IFS= read -r ssid; do
-        [[ -n "$ssid" ]] && known["$ssid"]=1
-    done < <(
-        nmcli -t -f TYPE,NAME connection show 2>/dev/null |
-        awk -F: '$1 == "802-11-wireless" { print substr($0,20) }'
-    )
-
-    # Available networks.
-    declare -A available
-
-    while IFS= read -r line; do
-        # nmcli terse output escapes ':'.
-        # We only need SSID, so remove everything after the final
-        # relevant fields by using awk with a cautious parser.
-        local ssid
-        ssid="$(printf '%s\n' "$line" | sed 's/:.*$//')"
-
-        [[ -n "$ssid" ]] && available["$ssid"]=1
-    done < <(
-        nmcli -t -f SSID dev wifi list --rescan no 2>/dev/null |
-        sed 's/\\:/::/g'
-    )
-
-    # A more reliable SSID list using nmcli's JSON output where available.
-    # Fall back to normal terse output above.
-    if command -v python3 >/dev/null 2>&1; then
-        while IFS= read -r ssid; do
-            [[ -n "$ssid" ]] && available["$ssid"]=1
-        done < <(
-            nmcli -t -f SSID dev wifi list --rescan no 2>/dev/null |
-            sed 's/\\:/\x00/g' |
-            tr '\0' ':' |
-            sed '/^$/d'
-        )
-    fi
-
-    # Build unique sorted list.
-    declare -A all
-    local ssid
-
-    for ssid in "${!known[@]}"; do
-        all["$ssid"]=1
-    done
-
-    for ssid in "${!available[@]}"; do
-        all["$ssid"]=1
-    done
-
-    if [[ -n "$connected" ]]; then
-        all["$connected"]=1
-    fi
-
-    if [[ "${#all[@]}" -eq 0 ]]; then
-        printf "│ %-56s │\n" "No Wi-Fi networks found."
-        echo "└──────────────────────────────────────────────────────────┘"
-        return
-    fi
-
-    echo "│ Name                                                     │"
-    echo "├──────────────────────────────────────────────────────────┤"
-
-    while IFS= read -r ssid; do
-        [[ -z "$ssid" ]] && continue
-
-        local state="available"
-
-        if [[ "$ssid" == "$connected" ]]; then
-            state="connected"
-        elif [[ "${known[$ssid]:-0}" == "1" ]]; then
-            state="known"
-        fi
-
-        # Keep the table usable with long SSIDs.
-        local display="$ssid"
-        if (( ${#display} > 38 )); then
-            display="${display:0:35}..."
-        fi
-
-        printf "│ %-38s │ %-14s │\n" "$display" "$state"
-    done < <(printf '%s\n' "${!all[@]}" | LC_ALL=C sort -f)
-
-    echo "└──────────────────────────────────────┴─────────────────┘"
-    echo
 }
 
-# ---------- Commands ----------
+# ------------------------------------------------------------
+# Detect Wi-Fi interface
+# ------------------------------------------------------------
 
-connect_wifi() {
-    local name="$1"
+detect_interface() {
+    IFACE="$(iw dev 2>/dev/null |
+        awk '$1 == "Interface" {print $2; exit}')"
 
-    [[ -n "$name" ]] || die "missing network name"
+    [[ -n "$IFACE" ]] ||
+        die "No Wi-Fi interface found."
 
-    if ! is_wifi_enabled; then
-        echo "Wi-Fi is disabled. Enabling it..."
-        nmcli radio wifi on || die "could not enable Wi-Fi"
-        sleep 1
-    fi
+    echo "$IFACE"
+}
 
-    echo "Connecting to: $name"
-    echo
+# ------------------------------------------------------------
+# YAML escaping
+#
+# Netplan YAML uses single-quoted strings.
+#
+# Example:
+#   John's WiFi
+#
+# becomes:
+#   'John''s WiFi'
+# ------------------------------------------------------------
 
-    # --ask makes nmcli interactively request required credentials.
-    # This supports passwords and authentication supported by
-    # NetworkManagers connection mechanism.
-    nmcli --ask device wifi connect "$name"
+yaml_quote() {
+    local value="$1"
+
+    value="${value//\'/\'\'}"
+
+    printf "'%s'" "$value"
+}
+
+# ------------------------------------------------------------
+# Check Wi-Fi radio
+# ------------------------------------------------------------
+
+wifi_blocked() {
+    rfkill list wifi 2>/dev/null |
+        grep -qiE 'Soft blocked: yes|Hard blocked: yes'
 }
 
 enable_wifi() {
-    if is_wifi_enabled; then
-        echo "Wi-Fi is already enabled."
-        return 0
-    fi
+    require_root "$@"
 
-    nmcli radio wifi on || die "could not enable Wi-Fi"
-    echo "Wi-Fi enabled."
+    rfkill unblock wifi
+
+    ip link set "$IFACE" up 2>/dev/null || true
+
+    success "Wi-Fi enabled."
 }
 
 disable_wifi() {
-    if ! is_wifi_enabled; then
-        echo "Wi-Fi is already disabled."
+    require_root "$@"
+
+    rfkill block wifi
+
+    success "Wi-Fi disabled."
+}
+
+# ------------------------------------------------------------
+# Current connection
+# ------------------------------------------------------------
+
+get_connected_ssid() {
+    iw dev "$IFACE" link 2>/dev/null |
+        sed -n 's/^[[:space:]]*SSID: //p' |
+        head -n 1
+}
+
+is_connected() {
+    iw dev "$IFACE" link 2>/dev/null |
+        grep -q '^Connected to '
+}
+
+# ------------------------------------------------------------
+# Get known SSIDs from our Netplan file
+# ------------------------------------------------------------
+
+get_known_networks() {
+    [[ -f "$CONFIG" ]] || return 0
+
+    awk '
+        /^      access-points:/ {
+            in_ap=1
+            next
+        }
+
+        in_ap && /^      [^ ]/ {
+            in_ap=0
+        }
+
+        in_ap && /^        / {
+            line=$0
+
+            sub(/^        /, "", line)
+
+            if (line ~ /^'\''/) {
+                sub(/^'\''/, "", line)
+                sub(/'\''$/, "", line)
+                gsub(/'\'''\''/, "'\''", line)
+
+                # Ignore password lines.
+                if (line !~ /^password:/)
+                    print line
+            }
+        }
+    ' "$CONFIG"
+}
+
+is_known() {
+    local target="$1"
+
+    while IFS= read -r network; do
+        [[ "$network" == "$target" ]] && return 0
+    done < <(get_known_networks)
+
+    return 1
+}
+
+# ------------------------------------------------------------
+# Scan Wi-Fi networks
+#
+# Output:
+#
+# SSID<TAB>SECURITY<TAB>SIGNAL
+#
+# Hidden networks are ignored.
+# Duplicate SSIDs are collapsed.
+# ------------------------------------------------------------
+
+scan_networks() {
+    local output
+
+    ip link set "$IFACE" up 2>/dev/null || true
+
+    output="$(iw dev "$IFACE" scan 2>/dev/null)" ||
+        return 0
+
+    awk '
+        function emit() {
+            if (ssid != "") {
+                printf "%s\t%s\t%s\n",
+                    ssid,
+                    security,
+                    signal
+            }
+        }
+
+        /^BSS / {
+            emit()
+
+            ssid=""
+            signal=""
+            security="OPEN"
+            next
+        }
+
+        /^[[:space:]]*SSID: / {
+            value=$0
+            sub(/^[[:space:]]*SSID: /, "", value)
+
+            if (value != "")
+                ssid=value
+
+            next
+        }
+
+        /^[[:space:]]*signal:/ {
+            value=$0
+            sub(/^[[:space:]]*signal: /, "", value)
+            sub(/ dBm.*/, "", value)
+
+            signal=value
+
+            next
+        }
+
+        /^[[:space:]]*RSN:/ {
+            security="WPA2"
+            next
+        }
+
+        /^[[:space:]]*WPA:/ {
+            if (security == "OPEN")
+                security="WPA"
+
+            next
+        }
+
+        END {
+            emit()
+        }
+    ' <<< "$output" |
+    awk -F '\t' '
+        {
+            ssid=$1
+
+            # Keep first occurrence.
+            if (!(ssid in seen)) {
+                seen[ssid]=1
+                print
+            }
+        }
+    ' |
+    sort -t $'\t' -k3,3nr
+}
+
+# ------------------------------------------------------------
+# Draw table
+# ------------------------------------------------------------
+
+show_table() {
+    local scan
+    local connected
+    local ssid
+    local security
+    local signal
+    local state
+    local display
+    local count=0
+
+    connected="$(get_connected_ssid)"
+
+    scan="$(scan_networks)"
+
+    echo
+    echo "┌────────────────────────────────┬────────────┬──────────┐"
+    printf "│ %-30s │ %-10s │ %-8s │\n" \
+        "NAME" "STATE" "SECURITY"
+    echo "├────────────────────────────────┼────────────┼──────────┤"
+
+    if [[ -n "$scan" ]]; then
+        while IFS=$'\t' read -r ssid security signal; do
+            [[ -n "$ssid" ]] || continue
+
+            ((count++))
+
+            if [[ "$ssid" == "$connected" ]]; then
+                state="CONNECTED"
+            elif is_known "$ssid"; then
+                state="KNOWN"
+            else
+                state="AVAILABLE"
+            fi
+
+            display="$ssid"
+
+            if (( ${#display} > 30 )); then
+                display="${display:0:27}..."
+            fi
+
+            printf "│ %-30s │ %-10s │ %-8s │\n" \
+                "$display" "$state" "$security"
+
+        done <<< "$scan"
+    fi
+
+    if (( count == 0 )); then
+        printf "│ %-30s │ %-10s │ %-8s │\n" \
+            "No networks found" "-" "-"
+    fi
+
+    echo "└────────────────────────────────┴────────────┴──────────┘"
+    echo
+}
+
+# ------------------------------------------------------------
+# Create Netplan configuration
+#
+# We replace ONLY our own 99-wifi-manager.yaml file.
+# Other Netplan files are untouched.
+# ------------------------------------------------------------
+
+write_config() {
+    local ssid="$1"
+    local password="${2:-}"
+
+    local quoted_ssid
+
+    quoted_ssid="$(yaml_quote "$ssid")"
+
+    mkdir -p /etc/netplan
+
+    cat > "$CONFIG" <<EOF
+network:
+  version: 2
+  renderer: networkd
+
+  wifis:
+    $IFACE:
+      dhcp4: true
+      dhcp6: true
+      access-points:
+        $quoted_ssid:
+EOF
+
+    if [[ -n "$password" ]]; then
+        local quoted_password
+        quoted_password="$(yaml_quote "$password")"
+
+        printf "          password: %s\n" "$quoted_password" >> "$CONFIG"
+    else
+        printf "          {}\n" >> "$CONFIG"
+    fi
+
+    chmod 600 "$CONFIG"
+}
+
+# ------------------------------------------------------------
+# Validate Netplan
+# ------------------------------------------------------------
+
+validate_config() {
+    netplan generate 2>&1
+}
+
+# ------------------------------------------------------------
+# Connect
+# ------------------------------------------------------------
+
+connect_wifi() {
+    require_root "$@"
+
+    local ssid="$1"
+    local password=""
+
+    [[ -n "$ssid" ]] ||
+        die "SSID cannot be empty."
+
+    echo
+    info "Connecting to: $ssid"
+    echo
+
+    # Make sure Wi-Fi isn't blocked.
+    rfkill unblock wifi
+    ip link set "$IFACE" up 2>/dev/null || true
+
+    # --------------------------------------------------------
+    # Determine whether this network is open.
+    # --------------------------------------------------------
+
+    local security=""
+
+    while IFS=$'\t' read -r found_ssid found_security found_signal; do
+        if [[ "$found_ssid" == "$ssid" ]]; then
+            security="$found_security"
+            break
+        fi
+    done < <(scan_networks)
+
+    # --------------------------------------------------------
+    # If we couldn't determine security, ask.
+    # --------------------------------------------------------
+
+    if [[ "$security" == "OPEN" ]]; then
+        info "Open network detected."
+    else
+        echo -n "Password: "
+        read -r -s password
+        echo
+
+        if [[ -z "$password" ]]; then
+            die "Password cannot be empty for a secured network."
+        fi
+    fi
+
+    # --------------------------------------------------------
+    # Save configuration.
+    # --------------------------------------------------------
+
+    info "Writing Netplan configuration..."
+
+    write_config "$ssid" "$password"
+
+    # --------------------------------------------------------
+    # Validate before applying.
+    # --------------------------------------------------------
+
+    info "Validating Netplan configuration..."
+
+    if ! validate_config; then
+        rm -f "$CONFIG"
+
+        die "Netplan rejected the configuration."
+    fi
+
+    # --------------------------------------------------------
+    # Apply.
+    # --------------------------------------------------------
+
+    info "Applying configuration..."
+
+    if ! netplan apply; then
+        die "Netplan failed to apply the configuration."
+    fi
+
+    echo
+    info "Waiting for connection..."
+
+    local i
+
+    for i in {1..20}; do
+        sleep 1
+
+        if is_connected; then
+            local current
+
+            current="$(get_connected_ssid)"
+
+            if [[ "$current" == "$ssid" ]]; then
+                echo
+                success "Connected to $ssid."
+
+                local ip
+
+                ip="$(ip -4 -o addr show "$IFACE" |
+                    awk '{print $4}' |
+                    head -n 1)"
+
+                [[ -n "$ip" ]] &&
+                    info "IPv4 address: $ip"
+
+                return 0
+            fi
+        fi
+
+        printf "."
+    done
+
+    echo
+    echo
+    warning "Connection was not established."
+
+    info "Current interface status:"
+    networkctl status "$IFACE" --no-pager 2>/dev/null || true
+
+    return 1
+}
+
+# ------------------------------------------------------------
+# Disconnect
+# ------------------------------------------------------------
+
+disconnect_wifi() {
+    require_root "$@"
+
+    if ! is_connected; then
+        warning "Wi-Fi is not currently connected."
         return 0
     fi
 
-    nmcli radio wifi off || die "could not disable Wi-Fi"
-    echo "Wi-Fi disabled."
+    info "Disconnecting..."
+
+    ip link set "$IFACE" down 2>/dev/null || true
+
+    success "Disconnected."
 }
 
-rescan_wifi() {
-    if ! is_wifi_enabled; then
-        die "Wi-Fi is disabled. Use -e/--enable first."
+# ------------------------------------------------------------
+# Forget current known network
+# ------------------------------------------------------------
+
+forget_wifi() {
+    require_root "$@"
+
+    local target="$1"
+
+    [[ -n "$target" ]] ||
+        die "Specify a network to forget."
+
+    [[ -f "$CONFIG" ]] ||
+        die "No saved Wi-Fi networks."
+
+    local temp
+    temp="$(mktemp)"
+
+    awk -v target="$target" '
+        BEGIN {
+            skip=0
+        }
+
+        /^        / {
+            line=$0
+            sub(/^        /, "", line)
+
+            if (line ~ /^'\''/) {
+                name=line
+                sub(/^'\''/, "", name)
+                sub(/'\''$/, "", name)
+                gsub(/'\'''\''/, "'\''", name)
+
+                if (name == target) {
+                    skip=1
+                    next
+                }
+
+                skip=0
+            }
+        }
+
+        skip && /^          / {
+            next
+        }
+
+        {
+            print
+        }
+    ' "$CONFIG" > "$temp"
+
+    mv "$temp" "$CONFIG"
+
+    chmod 600 "$CONFIG"
+
+    netplan generate 2>/dev/null || true
+
+    success "Forgot: $target"
+}
+
+# ------------------------------------------------------------
+# Show status
+# ------------------------------------------------------------
+
+show_status() {
+    local connected
+
+    connected="$(get_connected_ssid)"
+
+    echo
+    echo "Wi-Fi interface: $IFACE"
+
+    if wifi_blocked; then
+        echo "Radio:           disabled"
+    else
+        echo "Radio:           enabled"
     fi
 
-    echo "Scanning for Wi-Fi networks..."
-    nmcli device wifi rescan || die "Wi-Fi scan failed"
-    echo "Scan complete."
+    if [[ -n "$connected" ]]; then
+        echo "Connection:      connected"
+        echo "SSID:            $connected"
+    else
+        echo "Connection:      disconnected"
+    fi
+
+    local ip
+
+    ip="$(ip -4 -o addr show "$IFACE" |
+        awk '{print $4}' |
+        head -n 1)"
+
+    if [[ -n "$ip" ]]; then
+        echo "IPv4:            $ip"
+    else
+        echo "IPv4:            none"
+    fi
+
+    echo
+}
+
+# ------------------------------------------------------------
+# Rescan
+# ------------------------------------------------------------
+
+rescan() {
+    if wifi_blocked; then
+        warning "Wi-Fi is disabled."
+        return 1
+    fi
+
+    info "Scanning..."
+
     show_table
 }
 
-show_status() {
-    echo
-    echo "Wi-Fi status"
-    echo "────────────"
-
-    nmcli radio wifi
-
-    echo
-    echo "Devices"
-    echo "───────"
-
-    nmcli device status
-
-    echo
-    echo "Active connections"
-    echo "──────────────────"
-
-    nmcli connection show --active
-}
+# ------------------------------------------------------------
+# Known networks
+# ------------------------------------------------------------
 
 show_known() {
-    echo
-    echo "Known Wi-Fi networks"
-    echo "────────────────────"
-
     local found=0
 
-    while IFS= read -r line; do
-        local type name
-        type="${line%%:*}"
-        name="${line#*:}"
+    echo
+    echo "┌──────────────────────────────────────────┐"
+    printf "│ %-40s │\n" "KNOWN NETWORKS"
+    echo "├──────────────────────────────────────────┤"
 
-        if [[ "$type" == "802-11-wireless" ]]; then
-            printf "  • %s\n" "$name"
-            found=1
+    while IFS= read -r ssid; do
+        [[ -n "$ssid" ]] || continue
+
+        found=1
+
+        local display="$ssid"
+
+        if (( ${#display} > 40 )); then
+            display="${display:0:37}..."
         fi
-    done < <(
-        nmcli -t -f TYPE,NAME connection show 2>/dev/null
-    )
+
+        printf "│ %-40s │\n" "$display"
+    done < <(get_known_networks)
 
     if (( found == 0 )); then
-        echo "  No known Wi-Fi networks."
+        printf "│ %-40s │\n" "No saved networks"
     fi
+
+    echo "└──────────────────────────────────────────┘"
+    echo
 }
 
-disconnect_wifi() {
-    local device
-
-    device="$(
-        nmcli -t -f DEVICE,TYPE device status 2>/dev/null |
-        awk -F: '$2 == "wifi" { print $1; exit }'
-    )"
-
-    [[ -n "$device" ]] || die "no Wi-Fi device found"
-
-    echo "Disconnecting $device..."
-    nmcli device disconnect "$device" || die "could not disconnect Wi-Fi"
-    echo "Disconnected."
-}
+# ------------------------------------------------------------
+# Help
+# ------------------------------------------------------------
 
 show_help() {
-    cat <<'EOF'
+    cat <<EOF
 
-wifi.sh - Wi-Fi controller
+$SCRIPT_NAME - Wi-Fi manager
 
 Usage:
-  wifi.sh                         Show Wi-Fi networks
-  wifi.sh -c, --connect NAME      Connect to a network
-  wifi.sh -e, --enable            Enable Wi-Fi
-  wifi.sh -d, --disable           Disable Wi-Fi
-  wifi.sh -r, --rescan            Rescan networks
-  wifi.sh -s, --status            Show Wi-Fi/device status
-  wifi.sh -k, --known             Show known/saved networks
-  wifi.sh -x, --disconnect        Disconnect current Wi-Fi
-  wifi.sh -h, --help              Show this help
+  $SCRIPT_NAME
+  $SCRIPT_NAME [command] [arguments]
+
+Commands:
+
+  -c, --connect NAME
+      Connect to a Wi-Fi network.
+
+  -d, --disable
+      Disable Wi-Fi.
+
+  -e, --enable
+      Enable Wi-Fi.
+
+  -r, --rescan
+      Scan for nearby Wi-Fi networks.
+
+  -s, --status
+      Show Wi-Fi status.
+
+  -k, --known
+      Show saved/known networks.
+
+  -x, --disconnect
+      Disconnect from the current Wi-Fi.
+
+  -f, --forget NAME
+      Forget a saved network.
+
+  -h, --help
+      Show this help.
 
 Examples:
-  wifi.sh
-  wifi.sh --connect "My WiFi"
-  wifi.sh -c "School Network"
-  wifi.sh --disable
-  wifi.sh -r
-  wifi.sh --status
 
-Network states:
-  connected   Currently connected
-  known       Saved by NetworkManager
-  available   Currently visible but not saved
+  $SCRIPT_NAME
+  sudo $SCRIPT_NAME --connect "My WiFi"
+  sudo $SCRIPT_NAME -e
+  sudo $SCRIPT_NAME -d
+  $SCRIPT_NAME -r
+  $SCRIPT_NAME -s
+  $SCRIPT_NAME -k
+  sudo $SCRIPT_NAME -x
+  sudo $SCRIPT_NAME -f "My WiFi"
 
-When connecting, NetworkManagers interactive authentication
-prompt is used, so passwords and other supported credentials
-are requested securely rather than being stored in this script.
+Notes:
+
+  Wi-Fi configuration is stored in:
+
+    $CONFIG
+
+  The script uses:
+
+    iw
+    netplan
+    systemd-networkd
+    wpa_supplicant
 
 EOF
 }
 
-# ---------- Argument parsing ----------
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 
-require_nmcli
+main() {
+    require_command iw
+    require_command rfkill
+    require_command netplan
+    require_command ip
 
-if [[ $# -eq 0 ]]; then
-    echo "use -h for help"
-    show_table
-    exit 0
-fi
+    IFACE="$(detect_interface)"
 
-while [[ $# -gt 0 ]]; do
+    # No arguments:
+    # print help hint + table
+    if [[ $# -eq 0 ]]; then
+        echo "use -h for help"
+
+        if wifi_blocked; then
+            warning "Wi-Fi is disabled."
+        else
+            show_table
+        fi
+
+        exit 0
+    fi
+
     case "$1" in
 
-        -h|--help)
-            show_help
-            ;;
-
         -c|--connect)
-            [[ $# -ge 2 ]] || die "option $1 requires a network name"
+            [[ $# -ge 2 ]] ||
+                die "Usage: $SCRIPT_NAME --connect \"SSID\""
+
             connect_wifi "$2"
-            shift
             ;;
 
         -e|--enable)
@@ -330,7 +799,7 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         -r|--rescan)
-            rescan_wifi
+            rescan
             ;;
 
         -s|--status)
@@ -345,21 +814,22 @@ while [[ $# -gt 0 ]]; do
             disconnect_wifi
             ;;
 
-        --)
-            shift
-            break
+        -f|--forget)
+            [[ $# -ge 2 ]] ||
+                die "Usage: $SCRIPT_NAME --forget \"SSID\""
+
+            forget_wifi "$2"
             ;;
 
-        -*)
-            die "unknown option: $1 (use -h for help)"
+        -h|--help)
+            show_help
             ;;
 
         *)
-            die "unexpected argument: $1 (use -h for help)"
+            die "Unknown option: $1 (use -h for help)"
             ;;
 
     esac
+}
 
-    shift
-done
-```
+main "$@"
