@@ -142,9 +142,9 @@ jobs:
           {
             echo "## Install"
             echo
-            echo "```bash"
-            echo "curl -fsSL https://github.com/MegaCode111REAL/linux-simple-utils/releases/latest/download/install.sh | bash"
-            echo "```"
+            echo '```bash'
+            echo 'curl -fsSL https://github.com/MegaCode111REAL/linux-simple-utils/releases/latest/download/install.sh | bash'
+            echo '```'
             echo
             echo "## What's new"
             echo
