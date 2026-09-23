@@ -760,6 +760,8 @@ EOF
 # ------------------------------------------------------------
 
 main() {
+    require_root "$@"
+
     require_command iw
     require_command rfkill
     require_command netplan
