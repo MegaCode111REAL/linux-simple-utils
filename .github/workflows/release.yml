@@ -122,7 +122,7 @@ jobs:
             echo "Summarize ALL commits listed below since the previous release."
             echo "Group related changes where useful."
             echo "Do not invent features or details."
-            echo "Return ONLY concise Markdown bullet points."
+            echo "Return ONLY concise Markdown bullet points, such as 'Improved', 'Removed', 'Changed', or 'Fixed'."
             echo
             echo "Commits:"
             cat commits.txt
@@ -141,7 +141,9 @@ jobs:
           {
             echo "## Install"
             echo
+            echo "```bash"
             echo "curl -fsSL https://github.com/MegaCode111REAL/linux-simple-utils/releases/latest/download/install.sh | bash"
+            echo "```"
             echo
             echo "## What's new"
             echo
