@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       release_notes:
-        description: "Release notes"
+        description: "Extra release notes (optional)"
         required: false
         type: string
         default: ""
@@ -38,12 +38,13 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Validate and prepare release
         shell: bash
         env:
           VERSION_INPUT: ${{ inputs.version }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
           VERSION="$VERSION_INPUT"
@@ -52,7 +53,6 @@ jobs:
 
           if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid version: $VERSION_INPUT"
-            echo "Use a version such as 1.0.0, v1.0.0, or 1.0.0-beta.1."
             exit 1
           fi
 
@@ -69,7 +69,6 @@ jobs:
           chmod 755 dist/install.sh
           bash -n install.sh
 
-          printf '%s\n' "$RELEASE_NOTES" > release-notes.md
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Check release tag
@@ -82,6 +81,85 @@ jobs:
             exit 1
           fi
 
+      - name: Find previous release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="$(git tag --sort=-version:refname | grep -E '^v[0-9]+(\.[0-9]+){1,2}([.-][0-9A-Za-z.-]+)?$' | head -n 1 || true)"
+
+          if [[ -n "$previous_tag" ]]; then
+            echo "PREVIOUS_TAG=$previous_tag" >> "$GITHUB_ENV"
+          else
+            echo "PREVIOUS_TAG=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build commit list
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${PREVIOUS_TAG:-}" ]]; then
+            git log --no-merges --format='- %h %s (%an)' "$PREVIOUS_TAG..HEAD" > commits.txt
+          else
+            git log --no-merges --format='- %h %s (%an)' HEAD > commits.txt
+          fi
+
+          [[ -s commits.txt ]] || echo "- No new commits since the previous release." > commits.txt
+
+      - name: Install GitHub Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Generate AI commit summary
+        continue-on-error: true
+        shell: bash
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "You are writing release notes for linux-simple-utils."
+            echo "Summarize ALL commits listed below since the previous release."
+            echo "Group related changes where useful."
+            echo "Do not invent features or details."
+            echo "Return ONLY concise Markdown bullet points."
+            echo
+            echo "Commits:"
+            cat commits.txt
+          } > ai-prompt.txt
+
+          copilot -p "$(cat ai-prompt.txt)" --allow-all-tools > ai-summary.txt
+          [[ -s ai-summary.txt ]] || exit 1
+
+      - name: Build release notes
+        shell: bash
+        env:
+          EXTRA_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Install"
+            echo
+            echo "curl -fsSL https://github.com/MegaCode111REAL/linux-simple-utils/releases/latest/download/install.sh | bash"
+            echo
+            echo "## What's new"
+            echo
+
+            if [[ -s ai-summary.txt ]]; then
+              cat ai-summary.txt
+            else
+              cat commits.txt
+            fi
+
+            if [[ -n "$EXTRA_NOTES" ]]; then
+              echo
+              echo "## Additional notes"
+              echo
+              printf '%s\n' "$EXTRA_NOTES"
+            fi
+          } > release-notes.md
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,17 +171,8 @@ jobs:
 
           args=(
             "$TAG"
-            dist/wifi
-            dist/bluetooth
-            dist/network
-            dist/audio
-            dist/display
-            dist/power
-            dist/system
-            dist/users
-            dist/storage
-            dist/software
-            dist/security
+            dist/wifi dist/bluetooth dist/network dist/audio dist/display
+            dist/power dist/system dist/users dist/storage dist/software dist/security
             dist/install.sh
             --repo "${{ github.repository }}"
             --title "$RELEASE_NAME"
