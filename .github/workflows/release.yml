@@ -29,6 +29,7 @@ on:
 
 permissions:
   contents: write
+  copilot-requests: write
 
 jobs:
   release:
@@ -113,7 +114,7 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -128,7 +129,7 @@ jobs:
             cat commits.txt
           } > ai-prompt.txt
 
-          copilot -p "$(cat ai-prompt.txt)" --allow-all-tools > ai-summary.txt
+          copilot -p "$(cat ai-prompt.txt)" -s > ai-summary.txt
           [[ -s ai-summary.txt ]] || exit 1
 
       - name: Build release notes
