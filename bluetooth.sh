@@ -10,6 +10,15 @@ set -o pipefail
 
 # ---------- Helpers ----------
 
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        command -v sudo >/dev/null 2>&1 ||
+            die "sudo is required to run this utility."
+
+        exec sudo -- "$(readlink -f "$0")" "$@"
+    fi
+}
+
 die() {
     echo "bluetooth: $*" >&2
     exit 1
@@ -474,6 +483,8 @@ EOF
 }
 
 # ---------- Argument parsing ----------
+
+require_root "$@"
 
 require_bluetoothctl
 
